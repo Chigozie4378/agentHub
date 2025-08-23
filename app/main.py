@@ -17,6 +17,7 @@ from app.files.api import router as files_router
 from app.conversations.api import router as conversations_router
 from app.tools.browser.api import router as browser_router
 from app.tools.email.api import router as email_router
+from app.runs.api import router as runs_router
 
 TAGS_METADATA = [
     {"name": "Auth", "description": "Demo auth for Swagger 'Authorize' button"},
@@ -95,6 +96,6 @@ app.include_router(conversations_router)
 app.include_router(files_router)
 app.include_router(browser_router)
 app.include_router(email_router)
-
+app.include_router(runs_router)
 
 app.openapi = custom_openapi

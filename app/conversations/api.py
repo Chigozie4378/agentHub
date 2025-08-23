@@ -15,6 +15,12 @@ from app.conversations.service import (
 )
 from app.runs.service import create_run, add_step, finish_run
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from app.conversations.models import Message
+    from app.runs.models import Run
+
+
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
 
 # TODO: replace with real auth; for now a stubbed user id
@@ -63,93 +69,138 @@ async def post_message(conversation_id: str, payload: MessageCreate, db: Session
     if not msg:
         raise HTTPException(404, "Conversation not found")
 
-    text = payload.text.strip()
-    plan = ["receive_attachments"]
-    mode = "chat"
+    text = payload.text.strip().lower()
 
-    # Simple command router for Phase 2
-    async def execute_chat_like():
-        nonlocal plan
-        if payload.attachments:
-            from app.files.service import get_file_many, inline_bundle_for_files
-            files = get_file_many(db, uid, payload.attachments)
-            bundle = inline_bundle_for_files(files)
-            for fid in payload.attachments:
-                await sse.publish(conversation_id, "attachment_received", {"file_id": fid})
-            await sse.publish(conversation_id, "attachment_parsed", {
-                "count": len(files),
-                "sources": [{"file_id": s["file_id"], "filename": s["filename"]} for s in bundle["sources"]]
-            })
-            await sse.publish(conversation_id, "context_ready", {"sources": bundle["sources"]})
-            answer = "I read your files. " + (bundle["text"][:400].replace("\n", " ") + "..." if bundle["text"] else "No readable text found.")
-        else:
-            answer = "Message received. (Phase-0/2 demo)"
-        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan + ["generate_answer"]})
-        for tok in answer.split(" "):
-            await sse.publish(conversation_id, "token", {"text_chunk": tok + " "})
-        await sse.publish(conversation_id, "final_answer", {"text": answer, "citations": []})
+    # Convenience: allow "yes"/"no" to confirm/cancel latest pending run
+    from app.runs.service import get_latest_pending, confirm_run, cancel_run, finish_run, add_step, create_run
+    pending = get_latest_pending(db, conversation_id)
 
-    async def execute_browser(url: str, actions: list[dict] | None):
-        nonlocal plan
+    if text in ("yes", "y") and pending:
+        # execute the stored payload now
+        run = confirm_run(db, pending.id)
+        await sse.publish(conversation_id, "confirmation", {"run_id": run.id, "status": "confirmed"})
+        asyncio.create_task(_execute_pending_payload(conversation_id, run, db))
+        return _message_out(msg)
+
+    if text in ("no", "n", "cancel") and pending:
+        cancel_run(db, pending.id)
+        await sse.publish(conversation_id, "confirmation", {"run_id": pending.id, "status": "cancelled"})
+        return _message_out(msg)
+
+    # No pending confirmation or not yes/no -> treat as new request
+    # If attachments exist, keep Phase-0 inline bundle behavior (chat-only)
+    if payload.attachments and not text.startswith("!!"):
+        asyncio.create_task(_execute_chat_with_files(conversation_id, uid, payload, db))
+        return _message_out(msg)
+
+    # Detect tool commands and ask for confirmation
+    if text.startswith("!!browse"):
+        # parse url + optional actions json
+        import json
+        parts = payload.text.split(" ", 2)
+        url = parts[1] if len(parts) > 1 else ""
+        actions = None
+        if len(parts) == 3:
+            try: actions = json.loads(parts[2]).get("actions")
+            except Exception: actions = None
         plan = ["plan_browser", "open_page", "capture"]
-        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan})
-        from app.tools.browser.service import browse
-        out = await browse(url, actions)
-        await sse.publish(conversation_id, "artifact_ready", {"kind":"screenshot", "path": out["screenshot_path"]})
-        await sse.publish(conversation_id, "final_answer", {
-            "text": f"Opened {url} and captured a screenshot.",
-            "artifacts": [out["screenshot_path"]],
+        run = create_run(db, conversation_id, mode="task", plan=plan, needs_confirmation=True,
+                         pending_payload={"tool":"browser","url":url,"actions":actions})
+        # notify stream
+        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan, "run_id": run.id})
+        await sse.publish(conversation_id, "confirm_needed", {
+            "run_id": run.id,
+            "summary": f"Open {url} and take a screenshot.",
+            "how_to_confirm": {"rest":"POST /runs/{run_id}/confirm", "chat":"reply 'yes'"},
         })
+        from app.runs.service import mark_awaiting_confirmation
+        mark_awaiting_confirmation(db, run.id)
+        return _message_out(msg)
 
-    async def execute_email(command: str):
-        nonlocal plan
+    if text.startswith("!!email"):
+        cmd = payload.text[len("!!email"):].strip()
         plan = ["compose_email", "dry_run_save"]
-        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan})
-        # parse "to:...|subject:...|body:..."
-        parts = dict(p.split(":",1) for p in command.split("|") if ":" in p)
-        to = parts.get("to","").strip()
-        subject = parts.get("subject","").strip()
-        body = parts.get("body","").strip()
-        if not to or not subject:
-            await sse.publish(conversation_id, "final_answer", {"text": "Invalid email command. Use: !!email to:a@b.com|subject:Hi|body:..."})
-            return
-        from app.tools.email.service import draft_email
-        out = draft_email(to, subject, body)
-        await sse.publish(conversation_id, "artifact_ready", {"kind":"email_draft", "path": out["artifact_path"]})
-        await sse.publish(conversation_id, "final_answer", {"text": f"Drafted email to {to} (dry-run).", "artifact": out})
+        run = create_run(db, conversation_id, mode="task", plan=plan, needs_confirmation=True,
+                         pending_payload={"tool":"email","command":cmd})
+        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan, "run_id": run.id})
+        await sse.publish(conversation_id, "confirm_needed", {
+            "run_id": run.id,
+            "summary": f"Draft an email ({cmd})",
+            "how_to_confirm": {"rest":"POST /runs/{run_id}/confirm", "chat":"reply 'yes'"},
+        })
+        from app.runs.service import mark_awaiting_confirmation
+        mark_awaiting_confirmation(db, run.id)
+        return _message_out(msg)
 
-    run = create_run(db, conversation_id=conversation_id, mode=mode, plan=plan)
+    # default: plain chat with optional files handled above
+    asyncio.create_task(_execute_plain_chat(conversation_id, db))
+    return _message_out(msg)
 
-    import json
-    async def orchestrate():
-        if text.startswith("!!browse"):
-            # formats:
-            # 1) "!!browse https://example.com"
-            # 2) "!!browse https://example.com {\"actions\":[...]}"
-            parts = text.split(" ", 2)
-            url = parts[1] if len(parts) > 1 else ""
-            actions = None
-            if len(parts) == 3:
-                try:
-                    obj = json.loads(parts[2])
-                    actions = obj.get("actions")
-                except Exception:
-                    actions = None
-            await execute_browser(url, actions)
-        elif text.startswith("!!email"):
-            # "!!email to:a@b.com|subject:Hi|body:Hello"
-            cmd = text[len("!!email"):].strip()
-            await execute_email(cmd)
-        else:
-            await execute_chat_like()
-        finish_run(db, run.id, status="completed")
+# --- helpers below (paste into same file) ---
 
-    asyncio.create_task(orchestrate())
-
+def _message_out(msg: "Message") -> MessageOut:
     return MessageOut(
         id=msg.id, conversation_id=msg.conversation_id, role=msg.role,
         text=msg.text, attachments=msg.attachments, created_at=msg.created_at,
     )
+
+async def _execute_chat_with_files(conversation_id: str, uid: str, payload: MessageCreate, db: Session):
+    from app.files.service import get_file_many, inline_bundle_for_files
+    from app.runs.service import create_run, add_step, finish_run
+    files = get_file_many(db, uid, payload.attachments)
+    bundle = inline_bundle_for_files(files)
+    run = create_run(db, conversation_id, mode="chat", plan=["receive_attachments","parse_inline_context","generate_answer"])
+    for fid in payload.attachments:
+        await sse.publish(conversation_id, "attachment_received", {"file_id": fid})
+    await sse.publish(conversation_id, "attachment_parsed", {
+        "count": len(files),
+        "sources": [{"file_id": s["file_id"], "filename": s["filename"]} for s in bundle["sources"]]
+    })
+    await sse.publish(conversation_id, "context_ready", {"sources": bundle["sources"]})
+    text = "I read your files. " + (bundle["text"][:400].replace("\n", " ") + "..." if bundle["text"] else "No readable text found.")
+    for tok in text.split(" "):
+        await sse.publish(conversation_id, "token", {"text_chunk": tok + " "})
+    await sse.publish(conversation_id, "final_answer", {"text": text, "citations": []})
+    finish_run(db, run.id, status="completed")
+
+async def _execute_plain_chat(conversation_id: str, db: Session):
+    from app.runs.service import create_run, finish_run
+    run = create_run(db, conversation_id, mode="chat", plan=["generate_answer"])
+    await sse.publish(conversation_id, "reasoning_plan", {"steps": ["generate_answer"]})
+    text = "Message received. (Planner confirmation enabled for tools.)"
+    for tok in text.split(" "):
+        await sse.publish(conversation_id, "token", {"text_chunk": tok + " "})
+    await sse.publish(conversation_id, "final_answer", {"text": text, "citations": []})
+    finish_run(db, run.id, status="completed")
+
+async def _execute_pending_payload(conversation_id: str, run: "Run", db: Session):
+    from app.runs.service import add_step, finish_run
+    payload = run.pending_payload
+    tool = payload.get("tool")
+    if tool == "browser":
+        from app.tools.browser.service import browse
+        out = await browse(payload.get("url",""), payload.get("actions"))
+        await sse.publish(conversation_id, "artifact_ready", {"kind": "screenshot", "path": out.get("screenshot_path")})
+        await sse.publish(conversation_id, "final_answer", {
+            "text": f"Opened {payload.get('url')} and captured a screenshot.",
+            "artifacts": [out.get("screenshot_path")],
+        })
+        finish_run(db, run.id, status="completed")
+        return
+    if tool == "email":
+        from app.tools.email.service import draft_email
+        cmd = payload.get("command","")
+        parts = dict(p.split(":",1) for p in cmd.split("|") if ":" in p)
+        to = parts.get("to","").strip(); subject = parts.get("subject","").strip(); body = parts.get("body","").strip()
+        out = draft_email(to, subject, body)
+        await sse.publish(conversation_id, "artifact_ready", {"kind":"email_draft", "path": out["artifact_path"]})
+        await sse.publish(conversation_id, "final_answer", {"text": f"Drafted email to {to} (dry-run).", "artifact": out})
+        finish_run(db, run.id, status="completed")
+        return
+    # Unknown tool fallback
+    await sse.publish(conversation_id, "final_answer", {"text": "Pending action not recognized."})
+    finish_run(db, run.id, status="failed")
+
 
 @router.get("/{conversation_id}/stream")
 async def stream(conversation_id: str, request: Request):
