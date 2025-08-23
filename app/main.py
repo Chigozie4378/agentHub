@@ -5,6 +5,10 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.security import OAuth2PasswordRequestForm
 from app.shared.db import Base, engine
 
+# FILES
+from app.files import models as files_models  # noqa: F401
+from app.files.api import router as files_router
+
 # import models so they register with Base.metadata
 from app.conversations import models as conversations_models  # noqa: F401
 from app.runs import models as runs_models  # noqa: F401
@@ -82,6 +86,9 @@ from sqlalchemy import inspect
 @app.get("/__debug/tables")
 def _tables():
     return {"tables": inspect(engine).get_table_names()}
+
+app.include_router(conversations_router)
+app.include_router(files_router)
 
 
 app.openapi = custom_openapi
