@@ -63,65 +63,92 @@ async def post_message(conversation_id: str, payload: MessageCreate, db: Session
     if not msg:
         raise HTTPException(404, "Conversation not found")
 
-    # Build plan
+    text = payload.text.strip()
     plan = ["receive_attachments"]
-    if payload.attachments:
-        plan.append("parse_inline_context")
-    plan.append("generate_answer")
-    run = create_run(db, conversation_id=conversation_id, mode="chat", plan=plan)
+    mode = "chat"
 
-    async def execute():
-        idx = 0
-        # emit attachment events
-        for fid in payload.attachments:
-            await sse.publish(conversation_id, "attachment_received", {"file_id": fid})
-        bundle = None
+    # Simple command router for Phase 2
+    async def execute_chat_like():
+        nonlocal plan
         if payload.attachments:
             from app.files.service import get_file_many, inline_bundle_for_files
             files = get_file_many(db, uid, payload.attachments)
             bundle = inline_bundle_for_files(files)
+            for fid in payload.attachments:
+                await sse.publish(conversation_id, "attachment_received", {"file_id": fid})
             await sse.publish(conversation_id, "attachment_parsed", {
                 "count": len(files),
                 "sources": [{"file_id": s["file_id"], "filename": s["filename"]} for s in bundle["sources"]]
             })
-
-        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan})
-        if bundle:
             await sse.publish(conversation_id, "context_ready", {"sources": bundle["sources"]})
-
-        # Very simple Phase-0 “answer”: echo and brief stats from bundle
-        if bundle and bundle["text"].strip():
-            preview = bundle["text"][:400].replace("\n", " ")
-            answer = (
-                "I read your files. "
-                f"Sources: {len(bundle['sources'])}. "
-                f"Preview: {preview}..."
-            )
+            answer = "I read your files. " + (bundle["text"][:400].replace("\n", " ") + "..." if bundle["text"] else "No readable text found.")
         else:
-            answer = "Message received. (Phase-0 demo: tools/RAG not invoked yet.)"
+            answer = "Message received. (Phase-0/2 demo)"
+        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan + ["generate_answer"]})
+        for tok in answer.split(" "):
+            await sse.publish(conversation_id, "token", {"text_chunk": tok + " "})
+        await sse.publish(conversation_id, "final_answer", {"text": answer, "citations": []})
 
-        # stream tokens
-        for token in answer.split(" "):
-            await sse.publish(conversation_id, "token", {"text_chunk": token + " "})
-            add_step(db, run.id, idx, "token", {"text": token})
-            idx += 1
-
+    async def execute_browser(url: str, actions: list[dict] | None):
+        nonlocal plan
+        plan = ["plan_browser", "open_page", "capture"]
+        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan})
+        from app.tools.browser.service import browse
+        out = await browse(url, actions)
+        await sse.publish(conversation_id, "artifact_ready", {"kind":"screenshot", "path": out["screenshot_path"]})
         await sse.publish(conversation_id, "final_answer", {
-            "text": answer,
-            "citations": [{"file_id": s["file_id"]} for s in (bundle["sources"] if bundle else [])]
+            "text": f"Opened {url} and captured a screenshot.",
+            "artifacts": [out["screenshot_path"]],
         })
-        add_step(db, run.id, idx, "final", {"text": answer})
+
+    async def execute_email(command: str):
+        nonlocal plan
+        plan = ["compose_email", "dry_run_save"]
+        await sse.publish(conversation_id, "reasoning_plan", {"steps": plan})
+        # parse "to:...|subject:...|body:..."
+        parts = dict(p.split(":",1) for p in command.split("|") if ":" in p)
+        to = parts.get("to","").strip()
+        subject = parts.get("subject","").strip()
+        body = parts.get("body","").strip()
+        if not to or not subject:
+            await sse.publish(conversation_id, "final_answer", {"text": "Invalid email command. Use: !!email to:a@b.com|subject:Hi|body:..."})
+            return
+        from app.tools.email.service import draft_email
+        out = draft_email(to, subject, body)
+        await sse.publish(conversation_id, "artifact_ready", {"kind":"email_draft", "path": out["artifact_path"]})
+        await sse.publish(conversation_id, "final_answer", {"text": f"Drafted email to {to} (dry-run).", "artifact": out})
+
+    run = create_run(db, conversation_id=conversation_id, mode=mode, plan=plan)
+
+    import json
+    async def orchestrate():
+        if text.startswith("!!browse"):
+            # formats:
+            # 1) "!!browse https://example.com"
+            # 2) "!!browse https://example.com {\"actions\":[...]}"
+            parts = text.split(" ", 2)
+            url = parts[1] if len(parts) > 1 else ""
+            actions = None
+            if len(parts) == 3:
+                try:
+                    obj = json.loads(parts[2])
+                    actions = obj.get("actions")
+                except Exception:
+                    actions = None
+            await execute_browser(url, actions)
+        elif text.startswith("!!email"):
+            # "!!email to:a@b.com|subject:Hi|body:Hello"
+            cmd = text[len("!!email"):].strip()
+            await execute_email(cmd)
+        else:
+            await execute_chat_like()
         finish_run(db, run.id, status="completed")
 
-    asyncio.create_task(execute())
+    asyncio.create_task(orchestrate())
 
     return MessageOut(
-        id=msg.id,
-        conversation_id=msg.conversation_id,
-        role=msg.role,
-        text=msg.text,
-        attachments=msg.attachments,
-        created_at=msg.created_at,
+        id=msg.id, conversation_id=msg.conversation_id, role=msg.role,
+        text=msg.text, attachments=msg.attachments, created_at=msg.created_at,
     )
 
 @router.get("/{conversation_id}/stream")

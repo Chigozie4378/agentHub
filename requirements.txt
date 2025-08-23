@@ -8,3 +8,5 @@ pypdf
 python-docx
 openpyxl
 Pillow
+playwright
+email_validator
