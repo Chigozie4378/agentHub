@@ -9,3 +9,5 @@ __pycache__/
 # Local storage (we’ll use later)
 storage/uploads/
 storage/artifacts/
+# Local dev DB
+storage/*.db
