@@ -63,46 +63,65 @@ async def post_message(conversation_id: str, payload: MessageCreate, db: Session
     if not msg:
         raise HTTPException(404, "Conversation not found")
 
-    # Create a run & simulate a short plan + token stream via SSE
-    plan = ["receive_attachments"] + (["parse_inline_context"] if payload.attachments else []) + ["generate_answer"]
+    # Build plan
+    plan = ["receive_attachments"]
+    if payload.attachments:
+        plan.append("parse_inline_context")
+    plan.append("generate_answer")
     run = create_run(db, conversation_id=conversation_id, mode="chat", plan=plan)
 
-    async def simulate():
+    async def execute():
         idx = 0
-        # attachments events
+        # emit attachment events
         for fid in payload.attachments:
             await sse.publish(conversation_id, "attachment_received", {"file_id": fid})
+        bundle = None
         if payload.attachments:
-            await asyncio.sleep(0.05)
-            await sse.publish(conversation_id, "attachment_parsed", {"count": len(payload.attachments)})
+            from app.files.service import get_file_many, inline_bundle_for_files
+            files = get_file_many(db, uid, payload.attachments)
+            bundle = inline_bundle_for_files(files)
+            await sse.publish(conversation_id, "attachment_parsed", {
+                "count": len(files),
+                "sources": [{"file_id": s["file_id"], "filename": s["filename"]} for s in bundle["sources"]]
+            })
 
-        # plan + context ready
         await sse.publish(conversation_id, "reasoning_plan", {"steps": plan})
-        if payload.attachments:
-            await sse.publish(conversation_id, "context_ready", {"sources": payload.attachments})
+        if bundle:
+            await sse.publish(conversation_id, "context_ready", {"sources": bundle["sources"]})
 
-        # stream a fake answer in tokens
-        answer = "This is a placeholder answer for Phase-0 streaming. Your message was received."
-        for chunk in answer.split(" "):
-            await sse.publish(conversation_id, "token", {"text_chunk": chunk + " "})
-            add_step(db, run.id, idx, "token", {"text": chunk})
+        # Very simple Phase-0 “answer”: echo and brief stats from bundle
+        if bundle and bundle["text"].strip():
+            preview = bundle["text"][:400].replace("\n", " ")
+            answer = (
+                "I read your files. "
+                f"Sources: {len(bundle['sources'])}. "
+                f"Preview: {preview}..."
+            )
+        else:
+            answer = "Message received. (Phase-0 demo: tools/RAG not invoked yet.)"
+
+        # stream tokens
+        for token in answer.split(" "):
+            await sse.publish(conversation_id, "token", {"text_chunk": token + " "})
+            add_step(db, run.id, idx, "token", {"text": token})
             idx += 1
-            await asyncio.sleep(0.03)
 
-        await sse.publish(conversation_id, "final_answer", {"text": answer, "citations": []})
+        await sse.publish(conversation_id, "final_answer", {
+            "text": answer,
+            "citations": [{"file_id": s["file_id"]} for s in (bundle["sources"] if bundle else [])]
+        })
         add_step(db, run.id, idx, "final", {"text": answer})
         finish_run(db, run.id, status="completed")
 
-    asyncio.create_task(simulate())
+    asyncio.create_task(execute())
 
-    # Response shows the stored user message; assistant message will be “virtual” via stream
     return MessageOut(
         id=msg.id,
         conversation_id=msg.conversation_id,
         role=msg.role,
         text=msg.text,
         attachments=msg.attachments,
-        created_at=msg.created_at.isoformat(),
+        created_at=msg.created_at,
     )
 
 @router.get("/{conversation_id}/stream")
