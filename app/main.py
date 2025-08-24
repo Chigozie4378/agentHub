@@ -4,6 +4,10 @@ from fastapi.responses import JSONResponse
 from fastapi.openapi.utils import get_openapi
 from fastapi.security import OAuth2PasswordRequestForm
 from app.shared.db import Base, engine
+from app.shared.db import run_sqlite_migrations
+
+# Guards wall import
+from app.shared.me_api import router as me_router
 
 # import models so they register with Base.metadata
 from app.conversations import models as conversations_models  # noqa: F401
@@ -18,6 +22,7 @@ from app.conversations.api import router as conversations_router
 from app.tools.browser.api import router as browser_router
 from app.tools.email.api import router as email_router
 from app.runs.api import router as runs_router
+
 
 TAGS_METADATA = [
     {"name": "Auth", "description": "Demo auth for Swagger 'Authorize' button"},
@@ -38,6 +43,23 @@ if os.getenv("ENV", "dev") == "dev":
     @app.exception_handler(Exception)
     async def _dev_ex_handler(request: Request, exc: Exception):
         return JSONResponse(status_code=500, content={"detail": str(exc)})
+    
+@app.get("/__debug/loop")
+def _loop_info():
+    import asyncio, sys, threading
+    pol = type(asyncio.get_event_loop_policy()).__name__
+    try:
+        loop_name = type(asyncio.get_running_loop()).__name__
+    except RuntimeError:
+        loop_name = None
+    return {
+        "policy": pol,
+        "running_loop": loop_name,
+        "thread": threading.current_thread().name,
+        "python": sys.version,
+    }
+
+
 
 # ----------------------------------------------------------------------
 
@@ -45,6 +67,7 @@ if os.getenv("ENV", "dev") == "dev":
 @app.on_event("startup")
 def _init_db():
     Base.metadata.create_all(bind=engine)
+    run_sqlite_migrations()
 
 @app.get("/healthz", tags=["Health"])
 def healthz():
@@ -57,8 +80,6 @@ def auth_token(form: OAuth2PasswordRequestForm = Depends()):
     # Use any username/password in Swagger; we return a demo token.
     return {"access_token": "demo", "token_type": "bearer"}
 
-# Mount feature routers
-app.include_router(conversations_router)
 
 # --- Custom OpenAPI: add bearerAuth + default security (you can fine-tune per route) ---
 def custom_openapi():
@@ -92,6 +113,7 @@ def _tables():
     return {"tables": inspect(engine).get_table_names()}
 
 # Routers 
+app.include_router(me_router)
 app.include_router(conversations_router)
 app.include_router(files_router)
 app.include_router(browser_router)

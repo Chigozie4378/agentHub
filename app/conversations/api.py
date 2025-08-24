@@ -15,6 +15,10 @@ from app.conversations.service import (
 )
 from app.runs.service import create_run, add_step, finish_run
 
+from app.shared.guard import bump_for_user
+
+
+
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from app.conversations.models import Message
@@ -79,8 +83,9 @@ async def post_message(conversation_id: str, payload: MessageCreate, db: Session
         # execute the stored payload now
         run = confirm_run(db, pending.id)
         await sse.publish(conversation_id, "confirmation", {"run_id": run.id, "status": "confirmed"})
-        asyncio.create_task(_execute_pending_payload(conversation_id, run, db))
+        asyncio.create_task(_execute_pending_payload(conversation_id, run, db, uid))
         return _message_out(msg)
+
 
     if text in ("no", "n", "cancel") and pending:
         cancel_run(db, pending.id)
@@ -173,7 +178,7 @@ async def _execute_plain_chat(conversation_id: str, db: Session):
     await sse.publish(conversation_id, "final_answer", {"text": text, "citations": []})
     finish_run(db, run.id, status="completed")
 
-async def _execute_pending_payload(conversation_id: str, run: "Run", db: Session):
+async def _execute_pending_payload(conversation_id: str, run: "Run", db: Session, uid: str):
     from app.runs.service import add_step, finish_run
     payload = run.pending_payload
     tool = payload.get("tool")
@@ -185,6 +190,9 @@ async def _execute_pending_payload(conversation_id: str, run: "Run", db: Session
             "text": f"Opened {payload.get('url')} and captured a screenshot.",
             "artifacts": [out.get("screenshot_path")],
         })
+
+        # bump guard usage for this confirmed tool run
+        bump_for_user(db, uid, token_cost=8000)
         finish_run(db, run.id, status="completed")
         return
     if tool == "email":
@@ -195,6 +203,9 @@ async def _execute_pending_payload(conversation_id: str, run: "Run", db: Session
         out = draft_email(to, subject, body)
         await sse.publish(conversation_id, "artifact_ready", {"kind":"email_draft", "path": out["artifact_path"]})
         await sse.publish(conversation_id, "final_answer", {"text": f"Drafted email to {to} (dry-run).", "artifact": out})
+        
+        # bump guard usage
+        bump_for_user(db, uid, token_cost=3000)
         finish_run(db, run.id, status="completed")
         return
     # Unknown tool fallback

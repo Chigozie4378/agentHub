@@ -11,3 +11,4 @@ storage/uploads/
 storage/artifacts/
 # Local dev DB
 storage/*.db
+Note

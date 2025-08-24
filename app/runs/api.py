@@ -5,6 +5,10 @@ from app.runs.service import confirm_run, cancel_run
 from app.runs.models import Run
 from app.shared import sse
 
+
+from sqlalchemy import select, desc
+from app.runs.models import Run, Step
+
 router = APIRouter(prefix="/runs", tags=["Runs"])
 
 def current_user_id() -> str:  # stub for now
@@ -29,3 +33,20 @@ async def api_cancel_run(run_id: str, db: Session = Depends(get_db)):
     if r:
         await sse.publish(r.conversation_id, "confirmation", {"run_id": run_id, "status": "cancelled"})
     return {"ok": True, "run_id": run_id, "status": "cancelled"}
+
+
+@router.get("/by-conversation/{conversation_id}")
+def runs_for_conversation(conversation_id: str, db: Session = Depends(get_db)):
+    rows = db.scalars(
+        select(Run).where(Run.conversation_id==conversation_id).order_by(desc(Run.started_at)).limit(20)
+    ).all()
+    return [
+        {
+            "id": r.id,
+            "status": r.status,
+            "mode": r.mode,
+            "plan": r.plan,
+            "started_at": r.started_at,
+            "finished_at": r.finished_at
+        } for r in rows
+    ]

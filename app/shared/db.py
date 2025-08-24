@@ -23,3 +23,24 @@ def get_db():
         yield db
     finally:
         db.close()
+
+from sqlalchemy import text
+
+def run_sqlite_migrations():
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+        CREATE TABLE IF NOT EXISTS user_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            day TEXT NOT NULL,                 -- YYYYMMDD
+            tasks INTEGER NOT NULL DEFAULT 0,
+            tokens INTEGER NOT NULL DEFAULT 0
+        );
+        """)
+        # add the runs columns if not present (from earlier step)
+        cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(runs)").fetchall()]
+        if "needs_confirmation" not in cols:
+            conn.exec_driver_sql("ALTER TABLE runs ADD COLUMN needs_confirmation BOOLEAN DEFAULT 0")
+        if "pending_payload_json" not in cols:
+            conn.exec_driver_sql("ALTER TABLE runs ADD COLUMN pending_payload_json TEXT DEFAULT '{}'")
+

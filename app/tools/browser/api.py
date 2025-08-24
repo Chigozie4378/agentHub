@@ -1,29 +1,27 @@
-# app/tools/browser/api.py
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field, HttpUrl
-from typing import List, Dict, Any
-from app.shared.db import get_db
+from pydantic import BaseModel, AnyUrl
+from typing import List, Dict, Any, Optional
+from app.shared.guard import guard_gate, bump_after_tool
 from .service import browse
 
-# robust way to get the installed version
-from importlib.metadata import version, PackageNotFoundError
-try:
-    pw_version = version("playwright")
-except PackageNotFoundError:
-    pw_version = "unknown"
 
 router = APIRouter(prefix="/tools/browser", tags=["Tools: Browser"])
 
+class Action(BaseModel):
+    type: str
+    selector: Optional[str] = None
+    text: Optional[str] = None
+    y: Optional[int] = None
+    url: Optional[str] = None
+
 class BrowseReq(BaseModel):
-    url: HttpUrl
-    actions: List[Dict[str, Any]] = Field(default_factory=list)
+    url: AnyUrl
+    actions: Optional[List[Action]] = None
 
 @router.post("", summary="Open a page and take a screenshot")
-async def api_browse(body: BrowseReq, db = Depends(get_db)):
-    out = await browse(str(body.url), body.actions)
-    out.setdefault("playwright_version", pw_version)
+async def api_browse(body: BrowseReq, ctx = Depends(guard_gate("browser"))):
+    out = await browse(str(body.url), [a.model_dump() for a in body.actions] if body.actions else None)
+    # Always return JSON; bump usage only on success
+    if out.get("ok"):
+        bump_after_tool(ctx, token_cost=8000)
     return out
-
-@router.get("/diagnose", summary="Check Playwright availability")
-def diagnose():
-    return {"ok": True, "playwright_version": pw_version}
