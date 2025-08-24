@@ -1,49 +1,34 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Path, Query
 from pydantic import BaseModel
-from typing import List, Optional
-from app.shared.guard import guard_gate, bump_after_tool
+from typing import Literal
+from .service import create_todo, list_todos, update_todo, delete_todo
 
 router = APIRouter(prefix="/tools/todos", tags=["Tools: Todos"])
 
-class TodoCreate(BaseModel):
+def current_user_id() -> str:
+    return "demo-user"
+
+class TodoCreateIn(BaseModel):
     title: str
-    due_at: Optional[str] = None  # ISO8601
-    labels: Optional[List[str]] = None
+    due_at: str | None = None
+    labels: list[str] | None = None
 
-class TodoItem(BaseModel):
-    id: str
-    title: str
-    status: str = "pending"  # pending|completed
-    due_at: Optional[str] = None
-    labels: List[str] = []
+@router.post("")
+def api_todo_create(inb: TodoCreateIn):
+    return create_todo(current_user_id(), inb.title, inb.due_at, inb.labels or [])
 
-# In-memory scratchpad for now (replace with DB later)
-_MEM: dict[str, TodoItem] = {}
+@router.get("")
+def api_todo_list(status: Literal["pending","completed"] | None = Query(default=None)):
+    return list_todos(current_user_id(), status=status)
 
-@router.post("", summary="Create todo item")
-def create_todo(body: TodoCreate, ctx=Depends(guard_gate("todos"))):
-    import uuid
-    tid = uuid.uuid4().hex
-    item = TodoItem(id=tid, title=body.title, due_at=body.due_at, labels=body.labels or [])
-    _MEM[tid] = item
-    bump_after_tool(ctx, token_cost=500)
-    return {"ok": True, "id": tid, "item": item.model_dump()}
+class TodoUpdateIn(BaseModel):
+    status: Literal["pending","completed"] | None = None
 
-@router.get("", summary="List todo items")
-def list_todos(status: Optional[str] = Query(None, pattern="^(pending|completed)$"), ctx=Depends(guard_gate("todos"))):
-    items = list(_MEM.values())
-    if status:
-        items = [i for i in items if i.status == status]
-    return {"ok": True, "items": [i.model_dump() for i in items]}
+@router.patch("/{todo_id}")
+def api_todo_update(todo_id: str = Path(...), inb: TodoUpdateIn | None = None):
+    data = inb.dict(exclude_unset=True) if inb else {}
+    return update_todo(current_user_id(), todo_id, status=data.get("status"))
 
-@router.patch("/{todo_id}", summary="Mark complete or update")
-def update_todo(todo_id: str, status: Optional[str] = Query(None, pattern="^(pending|completed)$"), ctx=Depends(guard_gate("todos"))):
-    if todo_id not in _MEM: raise HTTPException(404, "Not found")
-    if status: _MEM[todo_id].status = status
-    bump_after_tool(ctx, token_cost=300)
-    return {"ok": True, "item": _MEM[todo_id].model_dump()}
-
-@router.delete("/{todo_id}", summary="Delete todo item")
-def delete_todo(todo_id: str, ctx=Depends(guard_gate("todos"))):
-    _MEM.pop(todo_id, None)
-    return {"ok": True}
+@router.delete("/{todo_id}")
+def api_todo_delete(todo_id: str = Path(...)):
+    return {"ok": delete_todo(current_user_id(), todo_id)}

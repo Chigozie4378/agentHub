@@ -1,41 +1,24 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from pydantic import BaseModel
-from typing import List, Optional
-from app.shared.guard import guard_gate, bump_after_tool
+from .service import create_note, summarize_notes
 
 router = APIRouter(prefix="/tools/notes", tags=["Tools: Notes"])
 
-class NoteCreate(BaseModel):
+def current_user_id() -> str:
+    return "demo-user"
+
+class NoteIn(BaseModel):
     text: str
-    tags: Optional[List[str]] = None
+    tags: list[str] | None = None
 
-class NoteItem(BaseModel):
-    id: str
-    text: str
-    tags: List[str] = []
+@router.post("")
+def api_notes_create(inb: NoteIn):
+    return create_note(current_user_id(), inb.text, inb.tags or [])
 
-_MEM: dict[str, NoteItem] = {}
+class NotesSumIn(BaseModel):
+    tag: str | None = None
+    since: str | None = None
 
-@router.post("", summary="Create note")
-def create_note(body: NoteCreate, ctx=Depends(guard_gate("notes"))):
-    import uuid
-    nid = uuid.uuid4().hex
-    item = NoteItem(id=nid, text=body.text, tags=body.tags or [])
-    _MEM[nid] = item
-    bump_after_tool(ctx, token_cost=400)
-    return {"ok": True, "id": nid, "item": item.model_dump()}
-
-class NotesSummReq(BaseModel):
-    tag: Optional[str] = None
-    since: Optional[str] = None  # ISO date
-
-@router.post("/summarize", summary="Summarize notes (baseline concat; later LLM)")
-def summarize_notes(req: NotesSummReq, ctx=Depends(guard_gate("notes"))):
-    items = list(_MEM.values())
-    if req.tag:
-        items = [i for i in items if req.tag in i.tags]
-    text = "\n\n".join(i.text for i in items)
-    # TODO: swap with LLM later
-    summary = text[:800] + ("..." if len(text) > 800 else "")
-    bump_after_tool(ctx, token_cost=1200)
-    return {"ok": True, "summary": summary, "count": len(items)}
+@router.post("/summarize")
+def api_notes_summarize(inb: NotesSumIn):
+    return summarize_notes(current_user_id(), tag=inb.tag, since=inb.since)

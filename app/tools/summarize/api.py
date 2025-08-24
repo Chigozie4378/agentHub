@@ -1,24 +1,21 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import Optional
-from app.shared.guard import guard_gate, bump_after_tool
-from app.files.service import get_file
-import re
+from sqlalchemy.orm import Session
+from app.shared.db import get_db
+from .service import summarize_document
 
 router = APIRouter(prefix="/tools/summarize", tags=["Tools: Summarize"])
 
-class SummReq(BaseModel):
-    file_id: str
-    max_chars: Optional[int] = 800
+def current_user_id() -> str:
+    return "demo-user"
 
-@router.post("", summary="Summarize a document (baseline heuristic)")
-def summarize(req: SummReq, ctx=Depends(guard_gate("summarize"))):
-    f = get_file(req.file_id)
-    if not f: raise HTTPException(404, "File not found")
-    # TODO: robust text extraction (pdfminer.six / python-docx etc.)
-    raw = open(f["path"], "rb").read().decode(errors="ignore")
-    # crude: collapse whitespace, keep first N chars
-    text = re.sub(r"\s+", " ", raw).strip()
-    summary = text[: (req.max_chars or 800)] + ("..." if len(text) > (req.max_chars or 800) else "")
-    bump_after_tool(ctx, token_cost=2200)
-    return {"ok": True, "summary": summary, "length": len(text)}
+class SummDocIn(BaseModel):
+    file_id: str
+    max_chars: int | None = 800
+
+@router.post("/document")
+def api_summarize_document(inb: SummDocIn, db: Session = Depends(get_db)):
+    out = summarize_document(db, current_user_id(), inb.file_id, max_chars=inb.max_chars or 800)
+    if out.get("error") == "file_not_found":
+        raise HTTPException(status_code=404, detail=f"File not found: {inb.file_id}")
+    return out
