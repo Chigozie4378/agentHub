@@ -19,8 +19,22 @@ from app.files import models as files_models  # noqa: F401
 # Routers Import
 from app.files.api import router as files_router
 from app.conversations.api import router as conversations_router
+
 from app.tools.browser.api import router as browser_router
 from app.tools.email.api import router as email_router
+from app.tools.registry_api import router as tools_registry_router
+from app.tools.pdf.api import router as pdf_router
+from app.tools.csv.api import router as csv_router
+from app.tools.places.api import router as places_router
+from app.tools.todos.api import router as todos_router
+from app.tools.notes.api import router as notes_router
+from app.tools.reminders.api import router as reminders_router
+from app.tools.calendar.api import router as calendar_router
+from app.tools.search.api import router as search_router
+from app.tools.download.api import router as download_router
+from app.tools.summarize.api import router as summarize_router
+from app.tools.sentiment.api import router as sentiment_router
+
 from app.runs.api import router as runs_router
 
 
@@ -116,8 +130,22 @@ def _tables():
 app.include_router(me_router)
 app.include_router(conversations_router)
 app.include_router(files_router)
+
 app.include_router(browser_router)
 app.include_router(email_router)
+app.include_router(tools_registry_router)
+app.include_router(pdf_router)
+app.include_router(csv_router)
+app.include_router(places_router)
+app.include_router(todos_router)
+app.include_router(notes_router)
+app.include_router(reminders_router)
+app.include_router(calendar_router)
+app.include_router(search_router)
+app.include_router(download_router)
+app.include_router(summarize_router)
+app.include_router(sentiment_router)
+
 app.include_router(runs_router)
 
 app.openapi = custom_openapi

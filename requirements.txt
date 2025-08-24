@@ -10,3 +10,8 @@ openpyxl
 Pillow
 playwright
 email_validator
+weasyprint
+markdown
+httpx
+vaderSentiment
+jsonschema
