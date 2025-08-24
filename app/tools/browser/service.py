@@ -1,25 +1,46 @@
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-import os, sys, json, subprocess, shlex, tempfile
+import os, sys, json, subprocess, shlex, tempfile, time
 
 from app.shared.artifacts import save_bytes
 from app.shared.config import settings
 
-# Prefer Playwright when available
+# --- CLI fallback helpers you already added (find browser + _cli_screenshot) ---
+
+def _cli_run(url: str, actions: List[Dict[str, Any]] | None) -> Dict[str, Any]:
+    """CLI doesn't support DOM interactions; we approximate:
+       - always goto(url)
+       - obey simple waits (wait ms)
+       - take a screenshot.
+       We record ignored interactive steps in step_errors.
+    """
+    acts = actions or []
+    step_errors = []
+    # honor waits (ms) to let pages load dynamic content
+    for step in acts:
+        if step.get("type") == "wait" and step.get("ms"):
+            time.sleep(max(0, int(step["ms"])) / 1000.0)
+        elif step.get("type") in ("click", "type", "wait_for"):
+            step_errors.append({"step": step, "error": "unsupported_in_cli"})
+    # one-shot screenshot
+    shot = _cli_screenshot(url)
+    if shot.get("ok"):
+        shot["step_errors"] = step_errors
+    return shot
+
+# ---- Playwright (prod) ----
+_HAS_PW = False
 try:
     from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError  # type: ignore
     _HAS_PW = True
 except Exception:
-    _HAS_PW = False
+    pass
 
 def _ensure_selector_policy():
-    """Force Selector policy (Windows only) so async subprocesses *can* work."""
     import asyncio
     if sys.platform.startswith("win"):
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        except Exception:
-            pass
+        try: asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except Exception: pass
 
 # ---------- Chrome/Edge CLI fallback ----------
 
@@ -119,67 +140,58 @@ def _cli_screenshot(url: str, width: int = 1366, height: int = 900) -> Dict[str,
 
 # ---------- Playwright primary (when it works) ----------
 
-async def _pw_browse(url: str, actions: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+async def _pw_browse(url: str, actions: List[Dict[str, Any]] | None) -> Dict[str, Any]:
     _ensure_selector_policy()
-    actions = actions or [{"type": "goto", "url": url}, {"type": "scroll", "y": 1200}]
-    if not actions or actions[0].get("type") != "goto":
-        actions = [{"type": "goto", "url": url}] + actions
-
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(viewport={"width": 1366, "height": 900}, ignore_https_errors=True)
+        browser = await p.chromium.launch(headless=True, args=["--disable-gpu","--no-sandbox","--disable-dev-shm-usage"])
+        context = await browser.new_context(viewport={"width":1366,"height":900}, ignore_https_errors=True)
         page = await context.new_page()
 
-        step_errors: list[dict] = []
-        for step in actions:
+        step_errors = []
+        # Always start with goto(url) even if actions provided
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        for step in (actions or []):
             try:
                 t = step.get("type")
-                if t == "goto":
+                if t == "goto" and step.get("url"):
                     await page.goto(step["url"], wait_until="domcontentloaded", timeout=30000)
-                elif t == "click":
+                elif t == "click" and step.get("selector"):
                     await page.click(step["selector"], timeout=15000)
+                elif t == "type" and step.get("selector") is not None:
+                    await page.fill(step["selector"], step.get("text",""), timeout=15000)
                 elif t == "scroll":
                     await page.mouse.wheel(0, int(step.get("y", 800)))
-                elif t == "type":
-                    await page.fill(step["selector"], step.get("text", ""), timeout=15000)
+                elif t == "wait_for" and step.get("selector"):
+                    await page.wait_for_selector(step["selector"], timeout=15000)
+                elif t == "wait" and step.get("ms"):
+                    await page.wait_for_timeout(int(step["ms"]))
                 else:
-                    step_errors.append({"step": step, "error": "unknown_action"})
+                    step_errors.append({"step": step, "error": "unknown_or_incomplete"})
             except PWTimeoutError as e:
                 step_errors.append({"step": step, "error": "timeout", "detail": str(e)})
             except Exception as e:
                 step_errors.append({"step": step, "error": "exception", "detail": repr(e)})
 
-        try:
-            await page.wait_for_timeout(300)
-        except Exception:
-            pass
-
         png = await page.screenshot(full_page=True)
-        art_path = save_bytes("screenshot", "png", png)
+        art_path = save_bytes("screenshot","png", png)
         await browser.close()
-
-    return {"ok": True, "screenshot_path": art_path, "actions": actions, "engine": "playwright", "step_errors": step_errors}
+    return {"ok": True, "screenshot_path": art_path, "engine": "playwright", "step_errors": step_errors}
 
 # ---------- Public API used by the router ----------
 
 async def browse(url: str, actions: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
-    # Force CLI on Windows unless you explicitly opt into Playwright
     engine = settings.BROWSER_ENGINE.lower()
-    if engine == "cli" or sys.platform.startswith("win"):
-        return _cli_screenshot(url)  # <- your existing CLI fallback
+    # Force CLI on Windows unless explicitly overridden to 'playwright'
+    if engine == "cli" or (sys.platform.startswith("win") and engine != "playwright"):
+        return _cli_run(url, actions)
 
-    if _HAS_PW and engine in ("auto", "playwright"):
+    if _HAS_PW and engine in ("auto","playwright"):
         try:
             return await _pw_browse(url, actions)
         except Exception as e:
-            out = _cli_screenshot(url)
-            if out.get("ok"):
-                out["note"] = f"Playwright failed: {repr(e)[:120]}"
+            out = _cli_run(url, actions)
+            if out.get("ok"): out["note"] = f"Playwright failed: {repr(e)[:120]}"
             return out
 
-    # No Playwright or engine=cli
-    return _cli_screenshot(url)
-
+    return _cli_run(url, actions)
