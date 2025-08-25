@@ -1,10 +1,13 @@
 # --- Auth stub so Swagger has an 'Authorize' flow ---
 from fastapi import FastAPI, Depends, Request
 from fastapi.responses import JSONResponse
+from app.auth.api import router as auth_router
 from fastapi.openapi.utils import get_openapi
 from fastapi.security import OAuth2PasswordRequestForm
 from app.shared.db import Base, engine
 from app.shared.db import run_sqlite_migrations
+from app.shared.config import settings
+from app.shared.auth import issue_dev_token
 
 # Guards wall import
 from app.shared.me_api import router as me_router
@@ -45,10 +48,10 @@ TAGS_METADATA = [
 ]
 
 app = FastAPI(
-    title="AgentHub (Phase 0)",
-    version="0.0.2",
-    description="Chat-first, file-aware API (Phase 0).",
-    openapi_tags=TAGS_METADATA,
+    title="AgentHub",
+    version="0.1.0",
+    description="Chat-first, file-aware API",
+    openapi_tags=[{"name": "Auth", "description": "Register / login for JWT"}],
 )
 
 # ---- DEV-ONLY error handler (helps you see real errors in Swagger) ----
@@ -91,34 +94,34 @@ def healthz():
 
 @app.post("/auth/token", tags=["Auth"])
 def auth_token(form: OAuth2PasswordRequestForm = Depends()):
-    # Use any username/password in Swagger; we return a demo token.
-    return {"access_token": "demo", "token_type": "bearer"}
+    # In real life, verify username/password here.
+    if settings.AUTH_DEMO:
+        return {"access_token": settings.DEMO_TOKEN, "token_type": "bearer", "demo": True}
+    token = issue_dev_token(sub=form.username)
+    return {"access_token": token, "token_type": "bearer", "demo": False}
 
 
 # --- Custom OpenAPI: add bearerAuth + default security (you can fine-tune per route) ---
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
-    schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
+    schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
     schema.setdefault("components", {}).setdefault("securitySchemes", {})
-    schema["components"]["securitySchemes"]["bearerAuth"] = {
-        "type": "http",
-        "scheme": "bearer",
-        "bearerFormat": "JWT",
+    schema["components"]["securitySchemes"] = {
+        "bearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+        }
     }
-    # Optional: make bearerAuth the default for all ops EXCEPT /auth/token and /healthz
     for path, ops in schema.get("paths", {}).items():
-        if path in ["/auth/token", "/healthz"]:
+        if path in ["/auth/register", "/auth/token", "/healthz"]:
             continue
         for op in ops.values():
             op.setdefault("security", [{"bearerAuth": []}])
     app.openapi_schema = schema
     return app.openapi_schema
+
 
 from sqlalchemy import inspect
 
@@ -127,6 +130,7 @@ def _tables():
     return {"tables": inspect(engine).get_table_names()}
 
 # Routers 
+app.include_router(auth_router)
 app.include_router(me_router)
 app.include_router(conversations_router)
 app.include_router(files_router)

@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.shared.db import get_db
 from app.shared.config import settings
+from app.shared.auth import get_user
 
 # stubbed auth -> always "demo-user" with DEFAULT_TIER
 def current_user():
@@ -39,7 +40,7 @@ def guard_gate(feature: str, requires_confirmation: bool = True):
     Enforces per-tier quotas and, optionally, confirmation requirement (we only enforce
     confirmation at the chat level; this guard just blocks if over quota).
     """
-    def _dep(user=Depends(current_user), db: Session = Depends(get_db)):
+    def _dep(user=Depends(get_user), db: Session = Depends(get_db)):
         uid = user["sub"]; tier = user.get("tier", settings.DEFAULT_TIER)
         usage = _read_usage(db, uid)
         if tier == "paid":

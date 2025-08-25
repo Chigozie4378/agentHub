@@ -15,3 +15,5 @@ markdown
 httpx
 vaderSentiment
 jsonschema
+python-jose
+bcrypt

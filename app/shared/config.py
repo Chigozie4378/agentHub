@@ -1,3 +1,4 @@
+# app/shared/config.py
 from pydantic import BaseModel
 import os
 
@@ -9,10 +10,15 @@ class Settings(BaseModel):
     PAID_TASK_LIMIT: int = int(os.getenv("PAID_TASK_LIMIT", "9999"))
     PAID_TOKEN_BUDGET: int = int(os.getenv("PAID_TOKEN_BUDGET", "10000000"))
 
-    # --- NEW: Browser engine selection ---
-    # auto | playwright | cli
-    BROWSER_ENGINE: str = os.getenv("BROWSER_ENGINE", "auto")
-    # Optional absolute path to chrome/msedge (for CLI fallback)
-    CHROME_PATH: str | None = os.getenv("CHROME_PATH")
+    # NEW: demo auth controls
+    AUTH_DEMO: bool = os.getenv("AUTH_DEMO", "true").lower() == "true"
+    DEMO_TOKEN: str = os.getenv("DEMO_TOKEN", "demo")
+
+    # NEW: JWT settings (for real mode)
+    JWT_KEY: str = os.getenv("JWT_KEY", "dev-secret")
+    JWT_ALG: str = os.getenv("JWT_ALG", "HS256")
+    JWT_ISS: str | None = os.getenv("JWT_ISS")
+    JWT_AUD: str | None = os.getenv("JWT_AUD")
+    JWT_EXPIRE_MIN: int = int(os.getenv("JWT_EXPIRE_MIN", "60"))
 
 settings = Settings()
